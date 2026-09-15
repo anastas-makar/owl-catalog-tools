@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "owl-catalog-tools"
+version = "0.1.1"
+description = "Build and validate Owl Game catalog releases"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "anastas-makar" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+owl-catalog = "owl_catalog_tools.build_catalog:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

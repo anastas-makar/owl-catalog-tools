@@ -5,6 +5,8 @@ from owl_catalog_tools.build_catalog import (
     require_coordinate,
     require_complete_unique_location_assignment,
     require_positive_integer,
+    normalize_locale,
+    validate_version_locale,
 )
 
 
@@ -50,6 +52,36 @@ class ValidationHelpersTest(unittest.TestCase):
             "Map 'test'",
             [],
         )
+
+    def test_locale_is_normalized(self) -> None:
+        self.assertEqual(normalize_locale(" RU "), "ru")
+        self.assertEqual(normalize_locale("pt_BR"), "pt-br")
+
+    def test_invalid_locale_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+                CatalogValidationError,
+                "locale must be",
+        ):
+            normalize_locale("russian")
+
+    def test_release_version_must_match_locale(self) -> None:
+        validate_version_locale("catalog-ru-v0.1.4", "ru")
+
+        with self.assertRaisesRegex(
+                CatalogValidationError,
+                "does not match",
+        ):
+            validate_version_locale("catalog-en-v0.1.4", "ru")
+
+    def test_old_release_version_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+                CatalogValidationError,
+                "catalog-<locale>-vX.Y.Z",
+        ):
+            validate_version_locale("catalog-v0.1.4", "ru")
+
+    def test_development_version_is_allowed(self) -> None:
+        validate_version_locale("dev-0123456789ab", "ru")
 
 
 if __name__ == "__main__":

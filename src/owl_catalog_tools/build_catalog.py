@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -167,6 +168,60 @@ ACQUISITION_SOURCES = {
 
 class CatalogValidationError(Exception):
     pass
+
+
+LOCALE_PATTERN = re.compile(
+    r"[a-z]{2,3}(?:-[a-z0-9]+)*"
+)
+RELEASE_VERSION_PATTERN = re.compile(
+    r"catalog-(?P<locale>[a-z]{2,3}(?:-[a-z0-9]+)*)-"
+    r"v[0-9]+\.[0-9]+\.[0-9]+"
+)
+
+
+def normalize_locale(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CatalogValidationError("locale is required")
+
+    normalized = value.strip().replace("_", "-").lower()
+
+    if LOCALE_PATTERN.fullmatch(normalized) is None:
+        raise CatalogValidationError(
+            "locale must be a lowercase language tag, "
+            "for example 'ru' or 'en'"
+        )
+
+    return normalized
+
+
+def validate_version_locale(
+        version: str,
+        locale: str,
+) -> None:
+    if not isinstance(version, str) or not version.strip():
+        raise CatalogValidationError("version is required")
+
+    # Ветки и pull request собираются с версиями dev-<sha>.
+    # Строгое соглашение применяется только к релизным версиям.
+    if not version.startswith("catalog-"):
+        return
+
+    match = RELEASE_VERSION_PATTERN.fullmatch(version)
+
+    if match is None:
+        raise CatalogValidationError(
+            "release version must match catalog-<locale>-vX.Y.Z, "
+            "for example catalog-ru-v0.1.4"
+        )
+
+    version_locale = match.group("locale")
+
+    if version_locale != locale:
+        raise CatalogValidationError(
+            f"version locale '{version_locale}' does not match "
+            f"catalog locale '{locale}'"
+        )
+
 
 def validate_acquisition_sources(
         catalog: dict[str, list[dict[str, Any]]],
@@ -2239,9 +2294,13 @@ def validate_catalog(
 def build_catalog(
         catalog_root: Path,
         version: str,
+        locale: str,
         commit_sha: str,
         require_image_keys: bool,
 ) -> dict[str, Any]:
+    normalized_locale = normalize_locale(locale)
+    validate_version_locale(version, normalized_locale)
+
     catalog: dict[
         str,
         list[dict[str, Any]],
@@ -2276,6 +2335,7 @@ def build_catalog(
 
     return {
         "version": version,
+        "locale": normalized_locale,
         "schemaVersion": CATALOG_SCHEMA_VERSION,
         "commitSha": commit_sha,
         "contentHash": content_hash,
@@ -2302,6 +2362,16 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--locale",
+        required=True,
+        help=(
+            "Catalog locale, for example ru or en. "
+            "Release versions must use the same locale: "
+            "catalog-<locale>-vX.Y.Z"
+        ),
+    )
+
+    parser.add_argument(
         "--commit-sha",
         required=True,
     )
@@ -2323,6 +2393,7 @@ def main() -> int:
                 args.catalog_dir
             ),
             version=args.version,
+            locale=args.locale,
             commit_sha=args.commit_sha,
             require_image_keys=args.require_image_keys,
         )
@@ -2349,6 +2420,9 @@ def main() -> int:
         )
         print(
             f"Version: {result['version']}"
+        )
+        print(
+            f"Locale: {result['locale']}"
         )
         print(
             f"Commit: {result['commitSha']}"

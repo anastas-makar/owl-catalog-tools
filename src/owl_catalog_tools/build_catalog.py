@@ -5,10 +5,42 @@ import hashlib
 import json
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPException
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+from PIL import Image, UnidentifiedImageError
 
 CATALOG_SCHEMA_VERSION = 1
+
+DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_IMAGE_REQUEST_ATTEMPTS = 3
+DEFAULT_IMAGE_VALIDATION_WORKERS = 8
+DEFAULT_FURNITURE_ASPECT_RATIO_TOLERANCE = 0.05
+MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024
+
+EXPECTED_IMAGE_CONTENT_TYPES = {
+    ".gif": {"image/gif"},
+    ".jpeg": {"image/jpeg"},
+    ".jpg": {"image/jpeg"},
+    ".png": {"image/png"},
+    ".webp": {"image/webp"},
+}
+
+RETRYABLE_HTTP_STATUS_CODES = {
+    408,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
 
 JAVA_INT_MIN = -2_147_483_648
 JAVA_INT_MAX = 2_147_483_647
@@ -787,6 +819,328 @@ def validate_all_image_references(
                 source=f"{category_name} '{template_id}'",
                 require_image_keys=require_image_keys,
             )
+
+
+def collect_image_key_sources(
+        value: Any,
+        source: str,
+        result: dict[str, list[str]],
+) -> None:
+    """Collect every imageKey and the catalog paths that use it."""
+    if isinstance(value, dict):
+        image_key = value.get("imageKey")
+
+        if isinstance(image_key, str) and image_key.strip():
+            result.setdefault(image_key, []).append(source)
+
+        for field_name, child in value.items():
+            if field_name == "imageKey":
+                continue
+
+            collect_image_key_sources(
+                child,
+                f"{source}.{field_name}",
+                result,
+            )
+
+        return
+
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            collect_image_key_sources(
+                child,
+                f"{source}[{index}]",
+                result,
+            )
+
+
+def build_image_url(
+        image_base_url: str,
+        image_key: str,
+) -> str:
+    base_url = image_base_url.strip()
+
+    if not base_url.startswith(("https://", "http://")):
+        raise CatalogValidationError(
+            "image base URL must start with http:// or https://"
+        )
+
+    return (
+        f"{base_url.rstrip('/')}/"
+        f"{quote(image_key, safe='/')}"
+    )
+
+
+def fetch_remote_image(
+        image_key: str,
+        image_url: str,
+        download: bool,
+        timeout_seconds: float,
+        attempts: int,
+) -> tuple[str, bytes | None]:
+    method = "GET" if download else "HEAD"
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        request = Request(
+            image_url,
+            method=method,
+            headers={
+                "User-Agent": "owl-catalog-tools/0.2",
+                "Accept": "image/*",
+            },
+        )
+
+        try:
+            with urlopen(
+                    request,
+                    timeout=timeout_seconds,
+            ) as response:
+                content_type = (
+                    response.headers
+                    .get_content_type()
+                    .lower()
+                )
+
+                content_length = response.headers.get(
+                    "Content-Length"
+                )
+
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        declared_length = None
+
+                    if (
+                            declared_length is not None
+                            and declared_length > MAX_REMOTE_IMAGE_BYTES
+                    ):
+                        raise CatalogValidationError(
+                            f"imageKey '{image_key}': remote image is "
+                            f"too large ({declared_length} bytes; maximum "
+                            f"is {MAX_REMOTE_IMAGE_BYTES} bytes)"
+                        )
+
+                if not download:
+                    return content_type, None
+
+                image_bytes = response.read(
+                    MAX_REMOTE_IMAGE_BYTES + 1
+                )
+
+                if len(image_bytes) > MAX_REMOTE_IMAGE_BYTES:
+                    raise CatalogValidationError(
+                        f"imageKey '{image_key}': remote image is too "
+                        f"large (maximum is {MAX_REMOTE_IMAGE_BYTES} bytes)"
+                    )
+
+                return content_type, image_bytes
+
+        except HTTPError as error:
+            last_error = error
+
+            if (
+                    error.code not in RETRYABLE_HTTP_STATUS_CODES
+                    or attempt == attempts
+            ):
+                raise CatalogValidationError(
+                    f"imageKey '{image_key}': S3 returned HTTP "
+                    f"{error.code} for {image_url}"
+                ) from error
+
+        except (URLError, OSError, HTTPException) as error:
+            last_error = error
+
+            if attempt == attempts:
+                raise CatalogValidationError(
+                    f"imageKey '{image_key}': cannot access S3 image "
+                    f"after {attempts} attempts: {error}"
+                ) from error
+
+        if attempt < attempts:
+            time.sleep(0.25 * attempt)
+
+    raise CatalogValidationError(
+        f"imageKey '{image_key}': cannot access S3 image: "
+        f"{last_error}"
+    )
+
+
+def validate_image_content_type(
+        image_key: str,
+        content_type: str,
+) -> None:
+    suffix = PurePosixPath(image_key).suffix.lower()
+    expected_types = EXPECTED_IMAGE_CONTENT_TYPES.get(suffix)
+
+    if expected_types is not None:
+        if content_type not in expected_types:
+            expected = " or ".join(sorted(expected_types))
+            raise CatalogValidationError(
+                f"imageKey '{image_key}': invalid Content-Type "
+                f"'{content_type}', expected {expected}"
+            )
+
+        return
+
+    if not content_type.startswith("image/"):
+        raise CatalogValidationError(
+            f"imageKey '{image_key}': invalid Content-Type "
+            f"'{content_type}', expected an image/* type"
+        )
+
+
+def read_image_dimensions(
+        image_key: str,
+        image_bytes: bytes,
+) -> tuple[int, int]:
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            image.verify()
+
+        with Image.open(BytesIO(image_bytes)) as image:
+            return image.size
+    except (
+            UnidentifiedImageError,
+            OSError,
+            Image.DecompressionBombError,
+    ) as error:
+        raise CatalogValidationError(
+            f"imageKey '{image_key}': the S3 object is not a valid "
+            f"supported image: {error}"
+        ) from error
+
+
+def validate_furniture_aspect_ratio(
+        furniture: dict[str, Any],
+        image_width: int,
+        image_height: int,
+        tolerance: float,
+) -> None:
+    furniture_id = furniture["templateId"]
+    catalog_width = float(furniture["width"])
+    catalog_height = float(furniture["height"])
+    image_ratio = image_width / image_height
+    catalog_ratio = catalog_width / catalog_height
+    difference = abs(catalog_ratio - image_ratio) / image_ratio
+
+    if difference > tolerance:
+        raise CatalogValidationError(
+            f"Furniture '{furniture_id}': aspect ratio mismatch: "
+            f"catalog width/height = {catalog_width:g}/"
+            f"{catalog_height:g} ({catalog_ratio:.4f}), image "
+            f"{furniture['imageKey']} = {image_width}x{image_height} "
+            f"({image_ratio:.4f}), difference = "
+            f"{difference * 100:.1f}%, allowed = "
+            f"{tolerance * 100:.1f}%"
+        )
+
+
+def validate_s3_images(
+        catalog: dict[str, list[dict[str, Any]]],
+        image_base_url: str,
+        furniture_aspect_ratio_tolerance: float,
+        timeout_seconds: float = (
+            DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS
+        ),
+        attempts: int = DEFAULT_IMAGE_REQUEST_ATTEMPTS,
+        workers: int = DEFAULT_IMAGE_VALIDATION_WORKERS,
+) -> None:
+    """
+    Check every imageKey against public S3 and compare furniture
+    pixel dimensions with catalog width/height.
+    """
+    if not 0 <= furniture_aspect_ratio_tolerance <= 1:
+        raise CatalogValidationError(
+            "furniture aspect-ratio tolerance must be between 0 and 1"
+        )
+
+    if timeout_seconds <= 0:
+        raise CatalogValidationError(
+            "image request timeout must be greater than 0"
+        )
+
+    if attempts < 1:
+        raise CatalogValidationError(
+            "image request attempts must be at least 1"
+        )
+
+    if workers < 1:
+        raise CatalogValidationError(
+            "image validation workers must be at least 1"
+        )
+
+    image_sources: dict[str, list[str]] = {}
+
+    for category_name, items in catalog.items():
+        for item in items:
+            collect_image_key_sources(
+                item,
+                f"{category_name} '{item['templateId']}'",
+                image_sources,
+            )
+
+    furniture_by_image_key: dict[
+        str,
+        list[dict[str, Any]],
+    ] = {}
+
+    for furniture in catalog["furniture"]:
+        image_key = furniture.get("imageKey")
+
+        if isinstance(image_key, str) and image_key.strip():
+            furniture_by_image_key.setdefault(
+                image_key,
+                [],
+            ).append(furniture)
+
+    def validate_one_image(image_key: str) -> None:
+        image_url = build_image_url(
+            image_base_url,
+            image_key,
+        )
+        furniture_items = furniture_by_image_key.get(
+            image_key,
+            [],
+        )
+        content_type, image_bytes = fetch_remote_image(
+            image_key=image_key,
+            image_url=image_url,
+            download=bool(furniture_items),
+            timeout_seconds=timeout_seconds,
+            attempts=attempts,
+        )
+        validate_image_content_type(
+            image_key,
+            content_type,
+        )
+
+        if not furniture_items:
+            return
+
+        assert image_bytes is not None
+        image_width, image_height = read_image_dimensions(
+            image_key,
+            image_bytes,
+        )
+
+        for furniture in furniture_items:
+            validate_furniture_aspect_ratio(
+                furniture,
+                image_width,
+                image_height,
+                furniture_aspect_ratio_tolerance,
+            )
+
+    # URL order is kept deterministic for error reporting, while a small
+    # worker pool prevents a large catalog from making hundreds of slow
+    # sequential S3 requests.
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(
+            validate_one_image,
+            sorted(image_sources),
+        ))
 
 def acquisition_source_allowed(
         item: dict[str, Any],
@@ -2297,6 +2651,11 @@ def build_catalog(
         locale: str,
         commit_sha: str,
         require_image_keys: bool,
+        validate_remote_images: bool = False,
+        image_base_url: str | None = None,
+        furniture_aspect_ratio_tolerance: float = (
+            DEFAULT_FURNITURE_ASPECT_RATIO_TOLERANCE
+        ),
 ) -> dict[str, Any]:
     normalized_locale = normalize_locale(locale)
     validate_version_locale(version, normalized_locale)
@@ -2319,6 +2678,25 @@ def build_catalog(
         catalog,
         require_image_keys=require_image_keys,
     )
+
+    if validate_remote_images:
+        if not require_image_keys:
+            raise CatalogValidationError(
+                "S3 image validation requires --require-image-keys"
+            )
+
+        if image_base_url is None or not image_base_url.strip():
+            raise CatalogValidationError(
+                "S3 image validation requires --image-base-url"
+            )
+
+        validate_s3_images(
+            catalog,
+            image_base_url=image_base_url,
+            furniture_aspect_ratio_tolerance=(
+                furniture_aspect_ratio_tolerance
+            ),
+        )
 
     # Хешируется только фактическое содержимое каталога.
     # Форматирование JSON и порядок полей на хеш не влияют.
@@ -2385,6 +2763,34 @@ def main() -> int:
         ),
     )
 
+    parser.add_argument(
+        "--validate-s3-images",
+        action="store_true",
+        help=(
+            "Check that every imageKey exists at --image-base-url, "
+            "has the expected image Content-Type, and that furniture "
+            "image proportions match catalog width/height"
+        ),
+    )
+
+    parser.add_argument(
+        "--image-base-url",
+        help=(
+            "Public base URL used to resolve imageKey values, for "
+            "example https://s3.regru.cloud/owlgame/"
+        ),
+    )
+
+    parser.add_argument(
+        "--furniture-aspect-ratio-tolerance",
+        type=float,
+        default=DEFAULT_FURNITURE_ASPECT_RATIO_TOLERANCE,
+        help=(
+            "Maximum relative difference between furniture width/height "
+            "and image pixel proportions (default: 0.05, or 5%%)"
+        ),
+    )
+
     args = parser.parse_args()
 
     try:
@@ -2396,6 +2802,11 @@ def main() -> int:
             locale=args.locale,
             commit_sha=args.commit_sha,
             require_image_keys=args.require_image_keys,
+            validate_remote_images=args.validate_s3_images,
+            image_base_url=args.image_base_url,
+            furniture_aspect_ratio_tolerance=(
+                args.furniture_aspect_ratio_tolerance
+            ),
         )
 
         output = Path(args.output)
